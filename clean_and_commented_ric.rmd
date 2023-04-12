@@ -1,0 +1,642 @@
+---
+title: "clean_and_commented"
+author: "Lærke Brædder"
+date: "2023-03-14"
+output: html_document
+---
+
+```{r Loading packages}
+pacman::p_load(tidyverse, 
+               here, 
+               posterior, 
+               cmdstanr, 
+               brms, 
+               tidybayes,
+               patchwork)
+```
+
+
+```{r Simulating data for simple WSLS agent playing against a random agent}
+
+set.seed(1234)
+
+sims <- 1
+trials <- 120
+otherBias <- 0.7 # The bias for the random opponent
+
+bias_seq <- seq(-1, 1, 0.2)
+beta_seq <- seq(-2, 2, 0.2)
+noise <-  0.05 # 5% of the trials are going in a random direction
+
+
+# Random bias agent
+randomAgent_f <- function(otherBias, noise) {
+  choice <- rbinom  (1, 1, otherBias) # We specify a mechanism and decision making
+  if (rbinom(1, 1, noise) == 1) {choice = rbinom(1, 1, 0.5)}
+  return(choice)
+}
+
+
+# WSLS agent
+WSLSAgent_f <- function(prevChoice, Feedback, beta, bias, noise){
+  if (Feedback == 0){ 
+    choice = rbinom(1,1, inv_logit_scaled(bias + beta * (prevChoice - 0.5) * -2))  # Shift if the feedback was 0
+  } else if (Feedback == 1) {
+    choice = rbinom(1,1, inv_logit_scaled(bias + beta * (prevChoice - 0.5) * 2))  # Stay if the feedback was 1  
+  }
+  
+  if (rbinom(1,1,noise)==1){choice <- rbinom(1,1,.5)}
+  
+  return(choice)}
+
+
+
+df <- data.frame()
+
+runSims_WSLS_vs_Random <- function(sims, trials, otherBias, beta_seq, bias_seq) {
+  for (sim in 1:sims) {
+    
+    for (bias in bias_seq) { # looping through bias levels
+      for (beta in beta_seq) { # looping through beta levels
+        
+        self <- rep(NA, trials)
+        other <- rep(NA, trials)
+        
+        # Filling out the first choice for the agent (self) and all of the random choices for the opponent (other)
+        self[1] <- randomAgent_f(0.5, noise)
+        for (t in seq(trials)) {
+          other[t] <- randomAgent_f(otherBias, noise)
+        }
+        
+        # Setting up the matching pennies game between self and other
+        for (t in 2:trials){
+          if (self[t - 1] == other[t - 1]){
+            feedback = 1
+          } 
+          else {feedback = 0}
+          
+          self[t] <- WSLSAgent_f(self[t - 1], feedback, beta, bias, noise)
+        }
+        
+        # Saving the results from all simulations in a dataframe
+        d <- data.frame(cbind(self, other))
+        # Adding columns for parameter ids
+        d$bias_lvl <- bias
+        d$beta_lvl <- beta
+        
+        d$trial <- seq.int(nrow(d))
+        
+        # Appending the simulation results to the full dataframe
+        df <- rbind(df, d)
+      }
+    }
+  }
+  
+  return(df)
+}
+
+
+
+d <- runSims_WSLS_vs_Random(sims, trials, otherBias, beta_seq, bias_seq)
+```
+
+
+
+
+```{r Preparing data, pt. 1/2}
+# Adding feedback (winning) column; If the WSLS agent won then it is coded 1, otherwise it is coded 0.
+d$won = 1
+d$won <- ifelse (d$self==0 & d$other==1, 0, d$won)
+d$won <- ifelse (d$self==1 & d$other==0, 0, d$won)
+
+# Adding a frequency of choice column; If the penny is in the right hand, then this is coded 1, if the penny is in the left hand, then this is coded -1.
+d$Fc = 1
+d$Fc <- ifelse (d$won==1 & d$self==0, -1, d$Fc)
+d$Fc <- ifelse (d$won==0 & d$self==1, -1, d$Fc)
+```
+
+
+```{r Preparing data, pt. 2/2}
+
+# Create subset at a single level of bias and beta
+d1 <- d %>% subset(bias_lvl == d$bias_lvl[17281] & beta_lvl == d$beta_lvl[17281])
+
+# To prepare the simulated data for Stan, we format it as a list rather than a tibble or a dataframe, as lists are more flexible to work with. 
+data <- list(
+  n = trials-1, # n of trials
+  choice = d1$self[2:trials], # sequence of choices
+  F_c = d1$Fc[1:trials-1]
+)
+```
+
+
+# Model
+Now, we are ready to model the simulated data. For the sake of having all of the code for this model visible in one document, we write the model in R and save it as a Stan file. This could also be done directly in a Stan file.
+
+```{r}
+stan_model <- "
+
+// Step 1 is to specify the input (i.e. the data for the model).
+data {
+ int<lower=1> n; // n is the number of trials in the data. It is specified as an integer with a lower boundary of 1 (as we cannot analyze a dataset with less than 1 trial.)
+ array[n] int choice; // choice is a list containing the sequence of choices that the WSLS agent made (right hand is coded as 1, left hand as 0). The choice variable is specified as an array of integers that has the length of n.
+ array[n] int F_c; // Frequency of choice. This is a feedback-like variable that tells us the frequency of the WSLS agent choosing the winning hand (1 for the winning hand, and -1 for the losing hand). It is specified as an array of integers that has the length of n.
+}
+
+// Step 2 is to specify the parameters that the model needs to estimate.
+parameters {
+  real bias; // Bias is the tendency of the WSLS follow the rule. This parameter is a on a log-odds scale, so – 3 means always doing the opposite of your rule, and +3 means always following the rule.
+  real beta; // Beta is the tendency of the WSLS agent to swith hand given that it loses a trial. Like bias, this  parameter is also on a log-odds scale.
+}
+
+// Step 3 is to specify the model to be estimated. In this case we are looking at a gaussian, with the parameters bias and beta, and priors on the bias and the beta.
+model {
+  // In the following two lines, we set the priors for our parameters. The priors for both of the parameters bias and beta are a gaussian distribution with a mean of 0 and an sd of 1. This means that the priors are relatively uninformed.
+  target += normal_lpdf(bias | 0, 1);
+  target += normal_lpdf(beta | 0, 1);
+  
+  // The model consists of a bernoulli distribution (binomial with just a single trial). The theta here is an expression of a linear model with bias as the intercept, beta as out slope, and the F_c variable as our x. This means that if beta is high then the model is deterministic, and if beta is close to 0.5 then the model is probablistic.
+  target += bernoulli_logit_lpmf(choice | bias + beta * to_vector(F_c)); // We use the bernoulli_logit to reperameterize, i.e. we use math to change the geometry of the model and make the model move in the spaces we want. We use it because we have an outcome (bound between 0 and 1, since it is a probability) generated through a binomial. The bernoulli_logit is an inverse logit, meaning that it takes whatever we put into it and squeezes it into the 0-1 space. 
+}
+"
+write_stan_file(
+  stan_model,
+  dir = "",
+  basename = "simple_wsls_ra_model.stan")
+```
+
+
+```{r}
+## Specify where the model is
+file <- file.path("simple_wsls_ra_model.stan")
+mod <- cmdstan_model(file,
+                     # this specifies we can parallelize the gradient estimations on multiple cores
+                     cpp_options = list(stan_threads = TRUE),
+                     # this is a trick to make it faster
+                     stanc_options = list("O1"))
+
+# The following command calls Stan with specific options.
+samples <- mod$sample(
+  data = data, # the data :-)
+  seed = 123,  # a seed, so I always get the same results
+  chains = 2,  # how many chains should I fit (to check whether they give the same results)
+  parallel_chains = 2, # how many of the chains can be run in parallel?
+  threads_per_chain = 2, # distribute gradient estimations within chain across multiple cores
+  iter_warmup = 1000,  # warmup iterations through which hyperparameters (steps and step length) are adjusted
+  iter_sampling = 2000, # total number of iterations
+  refresh = 0,  # how often to show that iterations have been run
+  max_treedepth = 20, # how many steps in the future to check to avoid u-turns
+  adapt_delta = 0.99, # how high a learning rate to adjust hyperparameters during warmup
+)
+```
+
+
+```{r}
+samples$summary() # summarize the model
+```
+
+
+```{r}
+# Extract posterior samples and include sampling of the prior:
+draws_df <- as_draws_df(samples$draws())
+
+# Checking the model's chains
+ggplot(draws_df, aes(.iteration, bias, group = .chain, color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+ggplot(draws_df, aes(.iteration, beta, group = .chain, color = .chain)) +
+  geom_line() +
+  theme_classic()
+```
+
+
+```{r}
+# add parameter priors
+draws_df <- draws_df %>% mutate(
+  bias_prior = rnorm(nrow(draws_df), 0, 1),  # we generate the bias and the betas as normal distributions
+  beta_prior = rnorm(nrow(draws_df), 0, 1)
+)
+
+# Plotting the density for bias (prior and posterior)
+ggplot(draws_df) +
+  geom_density(aes(bias), fill = "cornflowerblue", alpha = 0.3) +
+  geom_density(aes(bias_prior), fill = "hotpink", alpha = 0.3) +
+  geom_vline(xintercept = d1$bias_lvl[1], linetype = "dashed", color = "black", size = 1.5) +
+  xlab("Bias") +
+  ylab("Posterior Density") +
+  theme_classic()
+
+# Plotting the density for beta (prior and posterior)
+ggplot(draws_df) +
+  geom_density(aes(beta), fill = "cornflowerblue", alpha = 0.3) +
+  geom_density(aes(beta_prior), fill = "hotpink", alpha = 0.3) +
+  geom_vline(xintercept = d1$beta_lvl[1], linetype = "dashed", color = "black", size = 1.5) +
+  xlab("Beta") +
+  ylab("Posterior Density") +
+  theme_classic()
+```
+
+
+
+```{r Looping through different levels of bias and beta}
+recovery_df <- NULL
+
+
+for (biasLvl in unique(d$bias_lvl)) {
+  for (betaLvl in unique(d$beta_lvl)) {
+    
+    dd <- d %>% subset(
+      bias_lvl == biasLvl & beta_lvl == betaLvl
+    )
+    
+    data <- list(
+      n = trials-1,
+      choice = dd$self[2:trials],
+      F_c = dd$Fc[1:trials-1]
+      )
+    
+    samples <- mod$sample(
+      data = data,
+      seed = 123,
+      chains = 1,
+      parallel_chains = 1,
+      threads_per_chain = 1, 
+      iter_warmup = 1000,
+      iter_sampling = 2000,
+      refresh = 0, 
+      max_treedepth = 20, 
+      adapt_delta = 0.99,
+      )
+    
+    draws_df <- as_draws_df(samples$draws())
+    
+    temp <- tibble(biasEst = draws_df$bias, 
+                   betaEst = draws_df$beta,
+                   biasTrue = biasLvl, 
+                   betaTrue = betaLvl)
+    
+    if (exists("recovery_df")) {recovery_df <- rbind(recovery_df, temp)} else {recovery_df <- temp}
+    
+  }
+}
+
+write.csv(recovery_df, "recovery_df.csv", row.names=FALSE)
+```
+
+
+```{r}
+p1 <- ggplot(recovery_df, aes(biasTrue, biasEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  facet_wrap(.~betaTrue) +
+  theme_classic()
+
+p2 <- ggplot(recovery_df, aes(betaTrue, betaEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  facet_wrap(.~biasTrue) +
+  theme_classic()
+
+p1
+p2
+```
+
+
+
+
+
+
+
+#######################################################################################################################
+####################### Part 2: Implementing different biases for winning and losing ##################################
+#######################################################################################################################
+
+In real life, people have a tendency towards loss aversion, i.e. they are more strongly affected by an aversion towards losing that they are by a desire towards winning. In terms of our model, this would mean having a higher tendency/beta towards switching hands (closer to 1) when the agent loses a round, and a slightly lower tendency towards staying when the agent wins a round.
+
+
+```{r Simulating data for WSLS agent with diff bias for winning/losing playing against a random agent}
+sims <- 1
+trials <- 120
+otherBias <- 0.7 # The bias for the random opponent
+bias_seq <- seq(-1, 1, 0.2) # positive = right hand bias, negative = left hand bias
+win_beta_seq <- seq(-2, 2, 0.2) # the tendency of the WSLS agent to stay given a win
+loss_beta_seq <- seq(-2, 2, 0.2) # the tendency of the WSLS agent to switch given a loss
+noise <- 0.05
+
+
+# WSLS agent
+WSLSAgent_2_f <- function(prevChoice, Feedback, loss_beta, win_beta, bias, noise){
+  if (Feedback == 0){ 
+    choice = rbinom(1,1, inv_logit_scaled(bias + loss_beta * (prevChoice - 0.5) * -2)) 
+  } else if (Feedback == 1) {
+    choice = rbinom(1,1, inv_logit_scaled(bias + win_beta * (prevChoice - 0.5) * 2))    
+  }
+  
+  if (rbinom(1,1,noise)==1){choice <- rbinom(1,1,0.5)}
+  return(choice)
+}
+
+df <- data.frame()
+
+
+runSims_WSLS_vs_Random_2 <- function(sims, trials, otherBias, loss_beta_seq, win_beta_seq, bias_seq) {
+  for (sim in 1:sims) {
+    
+    for (bias in bias_seq) {
+      for (loss_beta in loss_beta_seq) {
+        for (win_beta in win_beta_seq) {
+          
+          self <- rep(NA, trials)
+          other <- rep(NA, trials)
+          
+          # Filling out the first choice for the agent (self) and all of the random choices for the opponent (other)
+          self[1] <- randomAgent_f(0.5, noise)
+          for (t in seq(trials)) {
+          other[t] <- randomAgent_f(otherBias, noise)
+          }
+          
+          # Setting up the matching pennies game between self and other
+          for (t in 2:trials){
+            if (self[t - 1] == other[t - 1]){
+              feedback = 1
+            }
+            else {feedback = 0}
+            
+            self[t] <- WSLSAgent_2_f(self[t - 1], feedback, loss_beta, win_beta, bias, noise)
+          }
+          
+          # Saving the results from all simulations in a dataframe
+          d <- data.frame(cbind(self, other))
+          # Adding columns for parameter ids
+          d$bias_lvl <- bias
+          d$loss_beta_lvl <- loss_beta
+          d$win_beta_lvl <- win_beta
+    
+          # Appending the simulation results to the full dataframe
+          df <- rbind(df, d)
+          
+        }
+      }
+    }
+  }
+  return(df)
+}
+
+d_2 <- runSims_WSLS_vs_Random_2(sims, trials, otherBias, loss_beta_seq, win_beta_seq, bias_seq)
+```
+
+```{r Preparing data, pt. 1/2}
+# Adding feedback (winning) column; If the WSLS agent won then it is coded 1, otherwise it is coded 0.
+d_2$won = 1
+d_2$won <- ifelse (d_2$self==0 & d_2$other==1, 0, d_2$won)
+d_2$won <- ifelse (d_2$self==1 & d_2$other==0, 0, d_2$won)
+
+# Adding a frequency of choice column; If the penny is in the right hand, then this is coded 1, if the penny is in the left hand, then this is coded -1.
+d_2$Fc = 1
+d_2$Fc <- ifelse (d_2$won==1 & d_2$self==0, -1, d_2$Fc)
+d_2$Fc <- ifelse (d_2$won==0 & d_2$self==1, -1, d_2$Fc)
+
+
+```
+
+```{r Preparing data, pt. 2/2}
+# Create subset at a single level of bias and beta
+d_22 <- d_2 %>% subset(bias_lvl == 0 & loss_beta_lvl == 2 & win_beta_lvl == 1)
+
+
+# To prepare the simulated data for Stan, we format it as a list rather than a tibble or a dataframe, as lists are more flexible to work with. 
+data <- list(
+  n = trials-1, # n of trials
+  choice = d_22$self[2:trials], 
+  prevWon = d_22$won[1:trials-1],
+  F_c = d_22$Fc[1:trials-1]
+)
+```
+
+```{r}
+stan_model <- "
+
+// Step 1: specify the input
+data {
+ int<lower=1> n;
+ array[n] int choice;
+ array[n] int F_c;
+ array[n] int prevWon; // Whether the participant won or lost the previous round. It is specified as an integer and is coded 1 or won and -1 for lost.
+}
+
+// Step 2: specify the parameters
+parameters {
+  real bias;
+  real loss_beta; // Beta parameter describing the participant's tendency to stick with the strategy given a loss. Like bias, this  parameter is also a probability bound between 0 and 1.
+  real win_beta; // Beta parameter describing the participant's tendency to stick with the strategy given a win.
+}
+
+// Step 3: specify the model. In this case we are looking at a gaussian, with the parameters bias, loss_beta and win_beta, and priors on the bias, loss_beta and win_beta.
+model {
+//In the following three lines, we set the priors for our parameters. The priors for all of the parameters bias and the two betas are a gaussian distribution with a mean of 0 and an sd of 1 (uninformed priors).
+  target += normal_lpdf(bias | 0, 1);
+  target += normal_lpdf(loss_beta | 0, 1);
+  target += normal_lpdf(win_beta | 0, 1);
+  
+  // For the model, we make a for loop over the trials, and in the loop we have an if/else statement for whether the agent won or lost on the previous trial. The model is similar to our first model, except if the agent lost on the previous trial, then it uses the loss-specific beta value, and if it won the it uses the winning-specific beta-value.
+  for (t in 1:n) {
+    if (prevWon[t] == 0) {
+      target += bernoulli_logit_lpmf(choice[t] | bias + loss_beta * to_vector(F_c)[t]);
+    } else {
+      target += bernoulli_logit_lpmf(choice[t] | bias + win_beta * to_vector(F_c)[t]);
+    }
+  }
+}
+"
+write_stan_file(
+  stan_model,
+  dir = "",
+  basename = "diffbias_wsls_ra_model.stan")
+```
+
+
+```{r}
+## Specify where the model is
+file <- file.path("diffbias_wsls_ra_model.stan")
+mod <- cmdstan_model(file,
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+# The following command calls Stan with specific options.
+samples_2 <- mod$sample(
+  data = data, 
+  seed = 123,  
+  chains = 2,  
+  parallel_chains = 2, 
+  threads_per_chain = 2, 
+  iter_warmup = 1000, 
+  iter_sampling = 2000, 
+  refresh = 0,  
+  max_treedepth = 20,
+  adapt_delta = 0.99, 
+)
+```
+
+
+
+```{r Results}
+samples_2$summary() # summarize the model
+
+# Extract posterior samples and include sampling of the prior:
+draws_df_2 <- as_draws_df(samples_2$draws())
+
+# Checking the model's chains
+chain2.1 <- ggplot(draws_df_2, aes(.iteration, bias, group = .chain, color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+chain2.2 <- ggplot(draws_df_2, aes(.iteration, loss_beta, group = .chain, color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+chain2.3 <- ggplot(draws_df_2, aes(.iteration, win_beta, group = .chain, color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+
+# add priors
+draws_df_2 <- draws_df_2 %>% mutate(
+  bias_prior = rnorm(nrow(draws_df_2), 0, 1),
+  loss_beta_prior = rnorm(nrow(draws_df_2), 0, 1),
+  win_beta_prior = rnorm(nrow(draws_df_2), 0, 1)
+)
+
+# Plotting the density for bias (prior and posterior)
+p2.1 <- ggplot(draws_df_2) +
+  geom_density(aes(bias), fill = "cornflowerblue", alpha = 0.3) +
+  geom_density(aes(bias_prior), fill = "hotpink", alpha = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 1.5) +
+  xlab("Bias") +
+  ylab("Posterior Density") +
+  theme_classic()
+
+# Plotting the density for loss_beta (prior and posterior)
+p2.2 <- ggplot(draws_df_2) +
+  geom_density(aes(loss_beta), fill = "cornflowerblue", alpha = 0.3) +
+  geom_density(aes(loss_beta_prior), fill = "hotpink", alpha = 0.3) +
+  geom_vline(xintercept = 0.8, linetype = "dashed", color = "black", size = 1.5) +
+  xlab("loss_beta") +
+  ylab("Posterior Density") +
+  theme_classic()
+
+# Plotting the density for win_beta (prior and posterior)
+p2.3 <- ggplot(draws_df_2) +
+  geom_density(aes(win_beta), fill = "cornflowerblue", alpha = 0.3) +
+  geom_density(aes(win_beta_prior), fill = "hotpink", alpha = 0.3) +
+  geom_vline(xintercept = 0.6, linetype = "dashed", color = "black", size = 1.5) +
+  xlab("win_beta") +
+  ylab("Posterior Density") +
+  theme_classic()
+
+chain2.1
+chain2.2
+chain2.3
+
+p2.1
+p2.2
+p2.3
+```
+
+
+```{r Looping through different levels of bias and beta}
+recovery_df <- NULL
+
+
+file <- file.path("diffbias_wsls_ra_model.stan")
+mod <- cmdstan_model(file,
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+
+for (biasLvl in unique(d_2$bias_lvl)) {
+  for (loss_betaLvl in unique(d_2$loss_beta_lvl)) {
+    for (win_betaLvl in unique(d_2$win_beta_lvl)) {
+      
+      dd_2 <- d_2 %>% subset(
+        bias_lvl == biasLvl & loss_beta_lvl == loss_betaLvl & win_beta_lvl == win_betaLvl
+        )
+      
+      data <- list(
+        n = trials-1,
+        choice = d_2$self[2:trials],
+        prevWon = d_2$won[1:trials-1],
+        F_c = d_2$Fc[1:trials-1]
+        )
+      
+    
+      samples <- mod$sample(
+        data = data,
+        seed = 123,
+        chains = 2,
+        parallel_chains = 2,
+        threads_per_chain = 2, 
+        iter_warmup = 1000,
+        iter_sampling = 2000,
+        refresh = 0, 
+        max_treedepth = 20, 
+        adapt_delta = 0.99,
+        )
+    
+      draws_df_2 <- as_draws_df(samples$draws())
+    
+      temp <- tibble(biasEst = draws_df_2$bias, 
+                    loss_betaEst = draws_df_2$loss_beta,
+                    win_betaEst = draws_df_2$win_beta,
+                    biasTrue = biasLvl, 
+                    loss_betaTrue = loss_betaLvl,
+                    win_betaTrue = win_betaLvl
+                    )
+    
+      if (exists("recovery_df")) {recovery_df <- rbind(recovery_df, temp)} else {recovery_df <- temp}
+      
+    }
+  }
+}
+
+write.csv(recovery_df, "recovery_df_complex.csv", row.names=FALSE)
+
+```
+
+
+```{r plotting}
+p2.1 <- ggplot(recovery_df, aes(biasTrue, biasEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  facet_wrap(.~loss_betaTrue) +
+  theme_classic()
+
+p2.2 <- ggplot(recovery_df, aes(biasTrue, biasEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  facet_wrap(.~win_betaTrue) +
+  theme_classic()
+
+p2.3 <- ggplot(recovery_df, aes(loss_betaTrue, loss_betaEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  facet_wrap(.~biasTrue) +
+  theme_classic()
+
+p2.4 <- ggplot(recovery_df, aes(win_betaTrue, win_betaEst)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  facet_wrap(.~biasTrue) +
+  theme_classic()
+
+p2.1
+p2.2
+p2.3
+p2.4
+```
+
+
+
+
+
+
